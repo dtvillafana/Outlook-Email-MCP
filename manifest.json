@@ -75,11 +75,19 @@
     },
     {
       "name": "list_recent_messages",
-      "description": "List recent Outlook emails and whether they have attachments."
+      "description": "List recent Outlook emails. Each result includes a messageId to pass to read_email or reply_outlook_email."
+    },
+    {
+      "name": "search_messages",
+      "description": "Full-text search Outlook mail. Each hit includes a messageId for read_email and reply_outlook_email."
+    },
+    {
+      "name": "list_flagged_messages",
+      "description": "List flagged Outlook emails, each with a messageId for read_email and reply_outlook_email."
     },
     {
       "name": "list_email_attachments",
-      "description": "List attachments for a specific Outlook email."
+      "description": "List attachments for a specific Outlook email by messageId."
     },
     {
       "name": "read_email_attachment",
@@ -87,7 +95,7 @@
     },
     {
       "name": "read_email",
-      "description": "Read the full text/body of a specific Outlook email (subject, sender, recipients, date, body)."
+      "description": "Read one Outlook email by messageId. After reading, reply in-thread with reply_outlook_email using the same messageId."
     },
     {
       "name": "read_email_body_chunk",
@@ -95,7 +103,11 @@
     },
     {
       "name": "send_outlook_email",
-      "description": "Compose an Outlook email with local file attachments (e.g. a .pptx) and save it as a draft or send it immediately."
+      "description": "Compose a new Outlook email with local file attachments (e.g. a .pptx) and save it as a draft or send it immediately. Starts a new conversation."
+    },
+    {
+      "name": "reply_outlook_email",
+      "description": "Reply in the same Outlook thread. Pass the messageId from list/search/read. Saves a draft by default, or sends immediately."
     }
   ],
   "compatibility": {

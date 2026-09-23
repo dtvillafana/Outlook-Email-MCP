@@ -9,7 +9,8 @@ A local `stdio` MCP server for Claude Desktop that reads Outlook emails and thei
 
 ## What's New in v0.2.0
 
-- **`send_outlook_email`** — compose an Outlook email with **local files attached** (e.g. a `.pptx`) and either save it as a **draft** for review (default) or send it immediately (`send_now: true`). Small attachments only (each < 3 MB, inlined via Microsoft Graph).
+- **`send_outlook_email`** — compose an Outlook email with **local files attached** (e.g. a `.pptx`) and either save it as a **draft** for review (default) or send it immediately (`send_now: true`). Small attachments only (each < 3 MB, inlined via Microsoft Graph). This starts a **new** conversation.
+- **`reply_outlook_email`** — reply to an existing message so the response stays in the **same Outlook conversation** (Graph `createReply` / `reply`, not `sendMail`). Draft by default; `send_now: true` sends immediately; `replyAll: true` includes all original recipients.
 - **`read_email`** — read the full **text/body** of a specific Outlook email (subject, sender, recipients, date; HTML converted to plain text). The original tools read *attachments*; this reads the *message body* itself.
 - **`list_recent_messages`** now also returns a `bodyPreview` snippet per message.
 - **Persistent login** — the MSAL token cache (incl. the refresh token) is now persisted to disk, so auth **survives app/process restarts**: sign in once and the server silently refreshes tokens (no more re-auth every restart). This makes unattended/scheduled use possible.
@@ -45,6 +46,7 @@ This server runs as a local MCP process started by Claude Desktop. It:
 4. Returns structured text and image blocks directly to Claude Desktop
 5. Reads the **text/body** of a specific email (HTML converted to plain text) via `read_email`, or in offset-based slices via `read_email_body_chunk` for long emails that exceed the single-call character limit
 6. Composes outgoing Outlook emails with **local files attached** (e.g. PPTX), saved as a draft for review or sent immediately
+7. Replies to an existing Outlook message **in the same conversation thread** via `reply_outlook_email`
 
 ### Supported Formats
 
@@ -70,14 +72,23 @@ This server runs as a local MCP process started by Claude Desktop. It:
 | `health_check` | Check if the server is alive |
 | `begin_auth` | Start device code login flow |
 | `auth_status` | Check authentication status |
-| `list_recent_messages` | List recent Outlook emails |
-| `list_email_attachments` | List attachments for a specific email |
+| `list_recent_messages` | List recent Outlook emails. Each result includes a `messageId` to pass to `read_email` / `reply_outlook_email`. |
+| `search_messages` | Full-text search. Each hit includes a `messageId` for the same chain. |
+| `list_flagged_messages` | List flagged emails, each with a `messageId`. |
+| `list_email_attachments` | List attachments for a specific email (`messageId`) |
 | `read_email_attachment` | Download, parse, and return attachment content |
-| `read_email` | Read the full text/body of a specific Outlook email (subject, sender, recipients, date, body) |
-| `read_email_body_chunk` | Read the message body in offset-based slices, for emails whose body was cut off by `read_email`'s character limit |
-| `send_outlook_email` | Attach local files (e.g. `.pptx`) and save a draft (default) or send immediately |
+| `read_email` | Read one email by `messageId` (subject, sender, recipients, date, body) |
+| `read_email_body_chunk` | Read the message body in offset-based slices when `read_email` truncated it |
+| `send_outlook_email` | Compose a **new** email, attach local files (e.g. `.pptx`), and save a draft (default) or send immediately. Starts a new conversation. |
+| `reply_outlook_email` | Reply to an existing message **in the same Outlook thread** using that `messageId`. Draft by default; `send_now: true` sends; `replyAll: true` includes all original recipients. |
 
-> **Outbound send is opt-in per call.** `send_outlook_email` defaults to creating a **draft** in your Drafts folder — nothing leaves your mailbox until you review and send it in Outlook. Pass `send_now: true` to send directly. Each attachment must be **under 3 MB** (see Limitations).
+**Typical chain (list → read → reply in-thread):**
+
+1. `list_recent_messages` / `search_messages` / `list_flagged_messages` — copy `messageId`
+2. `read_email` with that `messageId` (then `read_email_body_chunk` if the body was truncated)
+3. `reply_outlook_email` with the **same** `messageId` — this stays in the Outlook conversation
+
+> **Outbound send is opt-in per call.** `send_outlook_email` and `reply_outlook_email` default to creating a **draft** in your Drafts folder — nothing leaves your mailbox until you review and send it in Outlook. Pass `send_now: true` to send directly. Each attachment must be **under 3 MB** (see Limitations). Use `reply_outlook_email` for replies; `send_outlook_email` with an `RE:` subject still starts a **new** thread.
 
 ---
 
@@ -290,11 +301,15 @@ Find the latest invoice email and extract the total amount, due date, and line i
 Attach ~/Desktop/Daily Dash.pptx and save a draft to my manager — I'll send it from Outlook
 ```
 
+```text
+Reply to that email in the same thread and save a draft for me to review
+```
+
 ---
 
 ## Sending Email with Local Attachments
 
-The `send_outlook_email` tool composes an outgoing Outlook message with one or more **local files** attached and either saves it as a draft (default) or sends it.
+The `send_outlook_email` tool composes a **new** outgoing Outlook message with one or more **local files** attached and either saves it as a draft (default) or sends it. It does **not** join an existing conversation — use `reply_outlook_email` for that.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -317,6 +332,29 @@ The `send_outlook_email` tool composes an outgoing Outlook message with one or m
 
 ---
 
+## Replying in the Same Outlook Thread
+
+`send_outlook_email` always starts a **new** conversation, even if the subject is `RE: …`. Use `reply_outlook_email` instead: it calls Microsoft Graph `createReply` / `reply` (or `createReplyAll` / `replyAll`) so Outlook keeps `conversationId`, `In-Reply-To`, and the quoted original.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `messageId` | string | — (required) | ID of the message to reply to (from `list_recent_messages`, `search_messages`, or `read_email`). |
+| `body` | string | `""` | Reply text. Graph prepends this to the quoted original. |
+| `bodyType` | `"Text"` \| `"HTML"` | `"Text"` | Body content type. |
+| `replyAll` | boolean | `false` | `true` replies to the sender and all original recipients. |
+| `to`, `cc`, `bcc` | string \| string[] | — | Optional recipient overrides. Omit to use Graph's defaults. |
+| `attachments` | string[] | `[]` | Local file paths to attach. Same size limits as send. |
+| `send_now` | boolean | `false` | `false` saves a threaded draft; `true` sends immediately. |
+| `mailbox` | string | `"me"` | Mailbox to act as (defaults to the signed-in user). |
+
+**Behavior**
+
+- **Draft (default):** `POST /me/messages/{id}/createReply` (or `createReplyAll`), then patches in your reply text and returns the draft's `webLink`.
+- **Send now (`send_now: true`):** `POST /me/messages/{id}/reply` (or `replyAll`) in a single call. The reply is saved to Sent Items.
+- Recipients default to the original sender (`reply`) or everyone on the original (`replyAll`).
+
+---
+
 ## Troubleshooting
 
 | Problem | Solution |
@@ -327,7 +365,8 @@ The `send_outlook_email` tool composes an outgoing Outlook message with one or m
 | `Property api.requestedAccessTokenVersion is invalid` when saving account types | Open the Entra app → **Manifest** → set `requestedAccessTokenVersion` to `2` → save. Then retry changing the account type. |
 | Device code not showing | Make sure `begin_auth` was called successfully. Do not manually enter a code. |
 | Want to switch Microsoft accounts | Restart Claude Desktop and call `begin_auth` again in a private browser window. |
-| `send_outlook_email` fails with a permissions/`ErrorAccessDenied` error | Your login predates the send scopes. Add `Mail.ReadWrite` + `Mail.Send` to the Entra app, grant consent, restart Claude Desktop, and run `begin_auth` again to re-consent. |
+| `send_outlook_email` or `reply_outlook_email` fails with a permissions/`ErrorAccessDenied` error | Your login predates the send scopes. Add `Mail.ReadWrite` + `Mail.Send` to the Entra app, grant consent, restart Claude Desktop, and run `begin_auth` again to re-consent. |
+| Reply showed up as a new email instead of in the thread | The reply was sent with `send_outlook_email`. Use `reply_outlook_email` with the original `messageId`. |
 | "Attachment … exceeds the 3.00 MB per-file limit" | This build only inlines attachments under 3 MB. Compress the file or split the deck; large-attachment upload sessions are not enabled. |
 | "File is outside the allowed send directories" | The file is not under `M365_SEND_ALLOWED_DIRS`. Move the file into an allowed folder or update that env var (leave it blank to allow any path). |
 | Debug log location | `<M365_MCP_DATA_DIR>\debug.log` — defaults to a subdirectory auto-created next to `server.mjs`. |

@@ -586,6 +586,66 @@ function formatSender(fromName, fromAddress) {
   return fromName || fromAddress || "(unknown)";
 }
 
+const MESSAGE_ID_DESCRIPTION =
+  "Outlook messageId copied from list_recent_messages, search_messages, list_flagged_messages, or read_email. Use this same value for read_email and reply_outlook_email.";
+
+const MESSAGE_CHAIN_FOOTER =
+  "Next steps: pass messageId to read_email to read the body, then to reply_outlook_email to reply in the same Outlook thread. Do not use send_outlook_email for replies — that starts a new conversation.";
+
+const MESSAGE_CHAIN_NEXT_TOOLS = {
+  read: "read_email",
+  replyInThread: "reply_outlook_email",
+  passField: "messageId",
+};
+
+function recipientAddresses(recipients) {
+  return (recipients || [])
+    .map((item) => item?.emailAddress?.address)
+    .filter(Boolean);
+}
+
+function mapListedMessage(message) {
+  const id = message.id;
+  return {
+    id,
+    messageId: id,
+    subject: message.subject,
+    receivedDateTime: message.receivedDateTime,
+    hasAttachments: message.hasAttachments,
+    fromName: message.from?.emailAddress?.name || "",
+    fromAddress: message.from?.emailAddress?.address || "",
+    to: recipientAddresses(message.toRecipients),
+    cc: recipientAddresses(message.ccRecipients),
+    bodyPreview: message.bodyPreview || "",
+    isRead: message.isRead,
+    conversationId: message.conversationId || null,
+  };
+}
+
+function formatListedMessageText(message, index) {
+  const lines = [
+    `${index + 1}. ${message.subject || "(no subject)"}`,
+    `From: ${formatSender(message.fromName, message.fromAddress)}`,
+  ];
+  if (Array.isArray(message.to) && message.to.length) {
+    lines.push(`To: ${message.to.join(", ")}`);
+  }
+  lines.push(`Received: ${message.receivedDateTime}`);
+  lines.push(`Has Attachments: ${message.hasAttachments}`);
+  if (message.bodyPreview) {
+    lines.push(`Preview: ${String(message.bodyPreview).slice(0, 200)}`);
+  }
+  lines.push(`messageId: ${message.messageId || message.id}`);
+  return lines.join("\n");
+}
+
+function formatMessageListText(messages, emptyText) {
+  if (!messages.length) return emptyText;
+  return `${messages
+    .map((message, index) => formatListedMessageText(message, index))
+    .join("\n\n")}\n\n${MESSAGE_CHAIN_FOOTER}`;
+}
+
 function safeFilename(name) {
   return (name || "attachment.bin").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_");
 }
@@ -1769,6 +1829,86 @@ function loadLocalAttachment(filePath) {
   };
 }
 
+function prepareOutboundAttachments(attachments) {
+  const loaded = (attachments || []).map(loadLocalAttachment);
+  const totalBytes = loaded.reduce((sum, item) => sum + item.bytes, 0);
+  const oversizeFile = loaded.find((item) => item.bytes >= MAX_SEND_FILE_BYTES);
+
+  if (oversizeFile) {
+    throw new Error(
+      `Attachment "${oversizeFile.name}" is ${formatBytes(oversizeFile.bytes)}, which exceeds the ` +
+        `${formatBytes(MAX_SEND_FILE_BYTES)} per-file limit for inline sending.\n\n` +
+        "This build only supports small attachments via a single Graph request. Files >= 3 MB " +
+        "require the chunked upload-session flow, which is not enabled in this version."
+    );
+  }
+
+  if (totalBytes > MAX_SEND_TOTAL_BYTES) {
+    throw new Error(
+      `Total attachment size is ${formatBytes(totalBytes)}, which exceeds the inline send budget of ` +
+        `${formatBytes(MAX_SEND_TOTAL_BYTES)}. Send fewer or smaller files, or raise M365_SEND_MAX_BYTES ` +
+        "(it must still stay under Microsoft Graph's ~4 MB request limit)."
+    );
+  }
+
+  return { loaded, totalBytes };
+}
+
+function escapeHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function textToHtmlFragment(text) {
+  return escapeHtml(text).replace(/\n/g, "<br>\n");
+}
+
+function commentForOriginalBody(comment, commentType, originalContentType) {
+  const originalIsHtml = String(originalContentType || "").toLowerCase() === "html";
+  const commentIsHtml = commentType === "HTML";
+  if (!comment) return "";
+  if (originalIsHtml && !commentIsHtml) return textToHtmlFragment(comment);
+  if (!originalIsHtml && commentIsHtml) return htmlToPlainText(comment);
+  return comment;
+}
+
+function prependToDraftBody(draftBody, comment, commentType) {
+  const contentType = String(draftBody?.contentType || "Text");
+  const existing = draftBody?.content || "";
+  const prepared = commentForOriginalBody(comment, commentType, contentType);
+  if (!prepared) {
+    return { contentType, content: existing };
+  }
+
+  if (String(contentType).toLowerCase() === "html") {
+    const bodyTag = existing.match(/<body[^>]*>/i);
+    if (bodyTag) {
+      const idx = existing.indexOf(bodyTag[0]) + bodyTag[0].length;
+      return {
+        contentType: "HTML",
+        content: `${existing.slice(0, idx)}${prepared}<br><br>${existing.slice(idx)}`,
+      };
+    }
+    return { contentType: "HTML", content: `${prepared}<br><br>${existing}` };
+  }
+
+  return { contentType: "Text", content: `${prepared}\n\n${existing}` };
+}
+
+function formatRecipientAddresses(recipients) {
+  return recipientAddresses(recipients).join(", ");
+}
+
+function summarizeLoadedFiles(loaded) {
+  if (!loaded.length) return "(none)";
+  return loaded
+    .map((item) => `- ${item.name} (${formatBytes(item.bytes)}, ${item.attachment.contentType})`)
+    .join("\n");
+}
+
 function createServer() {
   const server = new McpServer({
     name: APP_NAME,
@@ -1899,7 +2039,7 @@ function createServer() {
 
       let nextUrl =
         `${collectionUrl}` +
-        `?$select=id,subject,receivedDateTime,hasAttachments,from,bodyPreview,isRead` +
+        `?$select=id,subject,receivedDateTime,hasAttachments,from,toRecipients,ccRecipients,bodyPreview,isRead,conversationId` +
         `&$orderby=receivedDateTime desc` +
         `&$top=${perPage}`;
 
@@ -1913,16 +2053,7 @@ function createServer() {
         scannedCount += batch.length;
         pages += 1;
 
-        let mapped = batch.map((message) => ({
-          id: message.id,
-          subject: message.subject,
-          receivedDateTime: message.receivedDateTime,
-          hasAttachments: message.hasAttachments,
-          fromName: message.from?.emailAddress?.name || "",
-          fromAddress: message.from?.emailAddress?.address || "",
-          bodyPreview: message.bodyPreview || "",
-          isRead: message.isRead,
-        }));
+        let mapped = batch.map(mapListedMessage);
 
         if (onlyWithAttachments) {
           mapped = mapped.filter((message) => message.hasAttachments);
@@ -1941,24 +2072,19 @@ function createServer() {
 
       messages = messages.slice(0, requestedTop);
 
-      const text =
-        messages.length > 0
-          ? messages
-              .map(
-                (message, index) =>
-                  `${index + 1}. ${message.subject || "(no subject)"}\nFrom: ${formatSender(message.fromName, message.fromAddress)}\nReceived: ${message.receivedDateTime}\nHas Attachments: ${message.hasAttachments}${message.bodyPreview ? `\nPreview: ${message.bodyPreview.slice(0, 200)}` : ""}\nMessage ID: ${message.id}`
-              )
-              .join("\n\n")
-          : [
-              "No recent messages matched the current filter.",
-              `Folder searched: ${folder || "inbox"}`,
-              `Messages scanned: ${scannedCount}`,
-              subjectNeedle ? `Subject filter: ${subjectContains}` : "",
-              fromNeedle ? `Sender filter: ${fromContains}` : "",
-              onlyWithAttachments ? "Attachment filter: hasAttachments=true" : "",
-            ]
-              .filter(Boolean)
-              .join("\n");
+      const text = formatMessageListText(
+        messages,
+        [
+          "No recent messages matched the current filter.",
+          `Folder searched: ${folder || "inbox"}`,
+          `Messages scanned: ${scannedCount}`,
+          subjectNeedle ? `Subject filter: ${subjectContains}` : "",
+          fromNeedle ? `Sender filter: ${fromContains}` : "",
+          onlyWithAttachments ? "Attachment filter: hasAttachments=true" : "",
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
 
       return {
         structuredContent: {
@@ -1972,6 +2098,7 @@ function createServer() {
           subjectContains: subjectContains || "",
           fromContains: fromContains || "",
           messages,
+          nextTools: MESSAGE_CHAIN_NEXT_TOOLS,
         },
         content: [{ type: "text", text }],
       };
@@ -1989,12 +2116,17 @@ function createServer() {
     {
       title: "List Recent Outlook Messages",
       description:
-        "List recent Outlook emails from Microsoft 365. By default this searches the Inbox, prefers emails with attachments, and can filter by subject or sender name/address.",
+        "List recent Outlook emails and return a messageId for each. Typical chain: list_recent_messages → read_email(messageId) → reply_outlook_email(messageId) to reply in the same thread. By default this searches the Inbox and prefers emails with attachments; set onlyWithAttachments=false when looking up mail to read or reply to. Can filter by subject or sender name/address.",
       inputSchema: z.object({
         mailbox: z.string().default("me"),
         folder: z.string().default("inbox"),
         top: z.number().int().min(1).max(2000).default(10),
-        onlyWithAttachments: z.boolean().default(true),
+        onlyWithAttachments: z
+          .boolean()
+          .default(true)
+          .describe(
+            "true (default) only returns emails with attachments. Set false when listing mail to read or reply to."
+          ),
         subjectContains: z.string().optional().default(""),
         fromContains: z.string().optional().default(""),
       }),
@@ -2012,7 +2144,7 @@ function createServer() {
       let nextUrl =
         `${collectionUrl}` +
         `?$search=${encodeURIComponent(searchValue)}` +
-        `&$select=id,subject,receivedDateTime,hasAttachments,from,toRecipients,ccRecipients,bodyPreview,isRead` +
+        `&$select=id,subject,receivedDateTime,hasAttachments,from,toRecipients,ccRecipients,bodyPreview,isRead,conversationId` +
         `&$top=${perPage}`;
 
       let messages = [];
@@ -2025,22 +2157,7 @@ function createServer() {
         scannedCount += batch.length;
         pages += 1;
 
-        let mapped = batch.map((message) => ({
-          id: message.id,
-          subject: message.subject,
-          receivedDateTime: message.receivedDateTime,
-          hasAttachments: message.hasAttachments,
-          fromName: message.from?.emailAddress?.name || "",
-          fromAddress: message.from?.emailAddress?.address || "",
-          to: (message.toRecipients || [])
-            .map((r) => r.emailAddress?.address)
-            .filter(Boolean),
-          cc: (message.ccRecipients || [])
-            .map((r) => r.emailAddress?.address)
-            .filter(Boolean),
-          bodyPreview: message.bodyPreview || "",
-          isRead: message.isRead,
-        }));
+        let mapped = batch.map(mapListedMessage);
 
         if (onlyWithAttachments) {
           mapped = mapped.filter((message) => message.hasAttachments);
@@ -2052,15 +2169,10 @@ function createServer() {
 
       messages = messages.slice(0, top);
 
-      const text =
-        messages.length > 0
-          ? messages
-              .map(
-                (message, index) =>
-                  `${index + 1}. ${message.subject || "(no subject)"}\nFrom: ${formatSender(message.fromName, message.fromAddress)}\nTo: ${message.to.join(", ")}\nReceived: ${message.receivedDateTime}\nHas Attachments: ${message.hasAttachments}${message.bodyPreview ? `\nPreview: ${message.bodyPreview.slice(0, 200)}` : ""}\nMessage ID: ${message.id}`
-              )
-              .join("\n\n")
-          : `No messages matched search query: ${query}`;
+      const text = formatMessageListText(
+        messages,
+        `No messages matched search query: ${query}`
+      );
 
       return {
         structuredContent: {
@@ -2072,6 +2184,7 @@ function createServer() {
           returnedCount: messages.length,
           onlyWithAttachments,
           messages,
+          nextTools: MESSAGE_CHAIN_NEXT_TOOLS,
         },
         content: [{ type: "text", text }],
       };
@@ -2089,7 +2202,7 @@ function createServer() {
     {
       title: "Search Outlook Messages",
       description:
-        "Full-text search Outlook mail (subject, body, sender, attachments) using Microsoft Graph's native $search, unbounded by recency. Searches the entire mailbox by default (folder='all'); pass a specific folder (e.g. 'inbox', 'archive') to narrow it.",
+        "Full-text search Outlook mail (subject, body, sender, attachments) using Microsoft Graph's native $search, unbounded by recency. Returns a messageId for each hit. Typical chain: search_messages → read_email(messageId) → reply_outlook_email(messageId) to reply in the same thread. Searches the entire mailbox by default (folder='all'); pass a specific folder (e.g. 'inbox', 'archive') to narrow it.",
       inputSchema: z.object({
         mailbox: z.string().default("me"),
         folder: z.string().default("all"),
@@ -2113,7 +2226,7 @@ function createServer() {
       let nextUrl =
         `${collectionUrl}` +
         `?$filter=${encodeURIComponent("flag/flagStatus eq 'flagged'")}` +
-        `&$select=id,subject,receivedDateTime,hasAttachments,from,toRecipients,ccRecipients,bodyPreview` +
+        `&$select=id,subject,receivedDateTime,hasAttachments,from,toRecipients,ccRecipients,bodyPreview,conversationId` +
         `&$top=${perPage}`;
 
       let messages = [];
@@ -2126,21 +2239,7 @@ function createServer() {
         scannedCount += batch.length;
         pages += 1;
 
-        const mapped = batch.map((message) => ({
-          id: message.id,
-          subject: message.subject,
-          receivedDateTime: message.receivedDateTime,
-          hasAttachments: message.hasAttachments,
-          fromName: message.from?.emailAddress?.name || "",
-          fromAddress: message.from?.emailAddress?.address || "",
-          to: (message.toRecipients || [])
-            .map((r) => r.emailAddress?.address)
-            .filter(Boolean),
-          cc: (message.ccRecipients || [])
-            .map((r) => r.emailAddress?.address)
-            .filter(Boolean),
-          bodyPreview: message.bodyPreview || "",
-        }));
+        const mapped = batch.map(mapListedMessage);
 
         messages = messages.concat(mapped);
         nextUrl = data["@odata.nextLink"] || null;
@@ -2149,15 +2248,10 @@ function createServer() {
       messages.sort((a, b) => (a.receivedDateTime < b.receivedDateTime ? 1 : -1));
       messages = messages.slice(0, top);
 
-      const text =
-        messages.length > 0
-          ? messages
-              .map(
-                (message, index) =>
-                  `${index + 1}. ${message.subject || "(no subject)"}\nFrom: ${formatSender(message.fromName, message.fromAddress)}\nTo: ${message.to.join(", ")}\nReceived: ${message.receivedDateTime}\nHas Attachments: ${message.hasAttachments}${message.bodyPreview ? `\nPreview: ${message.bodyPreview.slice(0, 200)}` : ""}\nMessage ID: ${message.id}`
-              )
-              .join("\n\n")
-          : `No flagged messages found in folder: ${folder || "inbox"}`;
+      const text = formatMessageListText(
+        messages,
+        `No flagged messages found in folder: ${folder || "inbox"}`
+      );
 
       return {
         structuredContent: {
@@ -2167,6 +2261,7 @@ function createServer() {
           pagesFetched: pages,
           returnedCount: messages.length,
           messages,
+          nextTools: MESSAGE_CHAIN_NEXT_TOOLS,
         },
         content: [{ type: "text", text }],
       };
@@ -2184,7 +2279,7 @@ function createServer() {
     {
       title: "List Flagged Outlook Messages",
       description:
-        "List Outlook messages flagged for follow-up (Graph flag/flagStatus = 'flagged'). Defaults to the inbox; pass folder='all' to search the whole mailbox. Newest-flagged-first.",
+        "List Outlook messages flagged for follow-up (Graph flag/flagStatus = 'flagged') and return a messageId for each. Typical chain: list_flagged_messages → read_email(messageId) → reply_outlook_email(messageId) to reply in the same thread. Defaults to the inbox; pass folder='all' to search the whole mailbox. Newest-flagged-first.",
       inputSchema: z.object({
         mailbox: z.string().default("me"),
         folder: z.string().default("inbox"),
@@ -2223,7 +2318,11 @@ function createServer() {
           : "This email has no downloadable attachments.";
 
       return {
-        structuredContent: { attachments },
+        structuredContent: {
+          messageId,
+          attachments,
+          nextTools: MESSAGE_CHAIN_NEXT_TOOLS,
+        },
         content: [{ type: "text", text }],
       };
     } catch (err) {
@@ -2239,9 +2338,10 @@ function createServer() {
     "list_email_attachments",
     {
       title: "List Email Attachments",
-      description: "List attachments for a specific Outlook email.",
+      description:
+        "List attachments for a specific Outlook email. Pass the same messageId from list_recent_messages, search_messages, or read_email. After reading, reply in-thread with reply_outlook_email using that messageId.",
       inputSchema: z.object({
-        messageId: z.string(),
+        messageId: z.string().describe(MESSAGE_ID_DESCRIPTION),
         mailbox: z.string().default("me"),
       }),
     },
@@ -2372,9 +2472,9 @@ function createServer() {
     {
       title: "Read Email Attachment",
       description:
-        "Download an Outlook attachment directly from Microsoft Graph and parse it locally. Supports PDF, OCR-scanned PDF, Word, PowerPoint, Excel, images, archives, MSG, and plain text. Large image previews are automatically downscaled to fit MCP payload limits.",
+        "Download an Outlook attachment directly from Microsoft Graph and parse it locally. Pass messageId from list_recent_messages/search_messages and attachmentId from list_email_attachments. Supports PDF, OCR-scanned PDF, Word, PowerPoint, Excel, images, archives, MSG, and plain text. Large image previews are automatically downscaled to fit MCP payload limits.",
       inputSchema: z.object({
-        messageId: z.string(),
+        messageId: z.string().describe(MESSAGE_ID_DESCRIPTION),
         attachmentId: z.string(),
         mailbox: z.string().default("me"),
       }),
@@ -2386,7 +2486,7 @@ function createServer() {
     const base = mailboxPrefix(mailbox);
     const url =
       `${base}/messages/${encodeURIComponent(messageId)}` +
-      `?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,hasAttachments,bodyPreview,body,webLink`;
+      `?$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,hasAttachments,bodyPreview,body,webLink,conversationId`;
     const m = await graphGetJson(url, {
       Prefer: 'outlook.body-content-type="text"',
     });
@@ -2425,6 +2525,7 @@ function createServer() {
         ccStr ? `Cc: ${ccStr}` : "",
         `Received: ${m.receivedDateTime || ""}`,
         `Has attachments: ${m.hasAttachments ? "yes" : "no"}`,
+        `messageId: ${m.id}`,
       ].filter(Boolean);
 
       if (truncated.truncated) {
@@ -2433,12 +2534,18 @@ function createServer() {
         );
       }
 
+      headerLines.push(
+        "To reply in this same Outlook thread, call reply_outlook_email with this messageId. Do not use send_outlook_email."
+      );
+
       const textOut = `${headerLines.join("\n")}\n\n${truncated.text || "(empty body)"}`;
 
       return {
         structuredContent: {
+          messageId: m.id,
           message: {
             id: m.id,
+            messageId: m.id,
             subject: m.subject,
             from: fromStr,
             to: toStr,
@@ -2447,10 +2554,17 @@ function createServer() {
             sentDateTime: m.sentDateTime,
             hasAttachments: !!m.hasAttachments,
             webLink: m.webLink,
+            conversationId: m.conversationId || null,
             bodyPreview: m.bodyPreview || "",
             bodyTextLength: bodyText.length,
             truncated: truncated.truncated,
             nextOffset: truncated.truncated ? truncated.returnedLength : null,
+          },
+          nextTools: {
+            replyInThread: "reply_outlook_email",
+            readMore: truncated.truncated ? "read_email_body_chunk" : null,
+            listAttachments: m.hasAttachments ? "list_email_attachments" : null,
+            passField: "messageId",
           },
         },
         content: [{ type: "text", text: textOut }],
@@ -2469,9 +2583,9 @@ function createServer() {
     {
       title: "Read Outlook Email Body",
       description:
-        "Fetch and return the full text of a specific Outlook email: subject, sender, recipients, date, and the message body (HTML is converted to plain text). Use list_recent_messages first to get the messageId. This reads the email body itself, complementing read_email_attachment which reads attachment contents.",
+        "Read one Outlook email by messageId (from list_recent_messages, search_messages, or list_flagged_messages): subject, sender, recipients, date, and body (HTML converted to plain text). After reading, reply in the same thread with reply_outlook_email using this same messageId — do not compose a new mail with send_outlook_email. For long bodies, continue with read_email_body_chunk. For files, use list_email_attachments / read_email_attachment.",
       inputSchema: z.object({
-        messageId: z.string(),
+        messageId: z.string().describe(MESSAGE_ID_DESCRIPTION),
         mailbox: z.string().default("me"),
       }),
     },
@@ -2551,9 +2665,9 @@ function createServer() {
     {
       title: "Read Outlook Email Body (Full, Chunked)",
       description:
-        "Fetch a slice of the full plain-text body of a specific Outlook email, for cases where read_email's body was cut off by its character limit. The body text is returned as bodyText in structuredContent and as text content. Call with offset=0 first, then re-call with the returned nextOffset to keep reading until hasMore is false. Use list_recent_messages first to get the messageId.",
+        "Fetch a slice of the full plain-text body of a specific Outlook email, for cases where read_email's body was cut off by its character limit. Pass the same messageId used with read_email. Call with offset=0 first, then re-call with the returned nextOffset until hasMore is false. After reading, reply in-thread with reply_outlook_email using this messageId.",
       inputSchema: z.object({
-        messageId: z.string(),
+        messageId: z.string().describe(MESSAGE_ID_DESCRIPTION),
         mailbox: z.string().default("me"),
         offset: z.number().int().min(0).default(0),
         maxChars: z
@@ -2593,46 +2707,13 @@ function createServer() {
       }
 
       let loaded;
+      let totalBytes;
       try {
-        loaded = (attachments || []).map(loadLocalAttachment);
+        ({ loaded, totalBytes } = prepareOutboundAttachments(attachments));
       } catch (fileErr) {
         return {
           isError: true,
           content: [{ type: "text", text: String(fileErr?.message || fileErr) }],
-        };
-      }
-
-      const totalBytes = loaded.reduce((sum, item) => sum + item.bytes, 0);
-      const oversizeFile = loaded.find((item) => item.bytes >= MAX_SEND_FILE_BYTES);
-
-      if (oversizeFile) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text:
-                `Attachment "${oversizeFile.name}" is ${formatBytes(oversizeFile.bytes)}, which exceeds the ` +
-                `${formatBytes(MAX_SEND_FILE_BYTES)} per-file limit for inline sending.\n\n` +
-                "This build only supports small attachments via a single Graph request. Files >= 3 MB " +
-                "require the chunked upload-session flow, which is not enabled in this version.",
-            },
-          ],
-        };
-      }
-
-      if (totalBytes > MAX_SEND_TOTAL_BYTES) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text:
-                `Total attachment size is ${formatBytes(totalBytes)}, which exceeds the inline send budget of ` +
-                `${formatBytes(MAX_SEND_TOTAL_BYTES)}. Send fewer or smaller files, or raise M365_SEND_MAX_BYTES ` +
-                "(it must still stay under Microsoft Graph's ~4 MB request limit).",
-            },
-          ],
         };
       }
 
@@ -2654,11 +2735,7 @@ function createServer() {
       }
 
       const base = mailboxPrefix(mailbox);
-      const fileSummary = loaded.length
-        ? loaded
-            .map((item) => `- ${item.name} (${formatBytes(item.bytes)}, ${item.attachment.contentType})`)
-            .join("\n")
-        : "(none)";
+      const fileSummary = summarizeLoadedFiles(loaded);
       const recipientSummary = [
         `To: ${normalizeEmailList(to).join(", ")}`,
         ccRecipients.length ? `Cc: ${normalizeEmailList(cc).join(", ")}` : "",
@@ -2743,7 +2820,7 @@ function createServer() {
     {
       title: "Send Outlook Email with Local Attachments",
       description:
-        "Compose an Outlook email with local files attached (e.g. a daily dashboard .pptx) and either save it as a draft for review (default) or send it immediately. Attachments are read from the local filesystem and inlined via Microsoft Graph; each file must be under 3 MB. Set send_now=true to send without review.",
+        "Compose a NEW Outlook email with local files attached (e.g. a daily dashboard .pptx) and either save it as a draft for review (default) or send it immediately. This starts a new conversation. Do not use it to reply to an existing message — use reply_outlook_email so the reply stays in the original Outlook thread. Attachments are read from the local filesystem and inlined via Microsoft Graph; each file must be under 3 MB. Set send_now=true to send without review.",
       inputSchema: z.object({
         to: z
           .union([z.string(), z.array(z.string())])
@@ -2768,6 +2845,247 @@ function createServer() {
       }),
     },
     sendEmailHandler
+  );
+
+  const replyEmailHandler = async ({
+    messageId,
+    body,
+    bodyType,
+    replyAll,
+    to,
+    cc,
+    bcc,
+    attachments,
+    send_now,
+    mailbox,
+  }) => {
+    try {
+      ensureConfigured();
+
+      if (!messageId || !String(messageId).trim()) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: "messageId is required. Use list_recent_messages, search_messages, or read_email to get it.",
+            },
+          ],
+        };
+      }
+
+      let loaded;
+      let totalBytes;
+      try {
+        ({ loaded, totalBytes } = prepareOutboundAttachments(attachments));
+      } catch (fileErr) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: String(fileErr?.message || fileErr) }],
+        };
+      }
+
+      const base = mailboxPrefix(mailbox);
+      const encodedId = encodeURIComponent(messageId);
+      const toRecipients = buildRecipients(to);
+      const ccRecipients = buildRecipients(cc);
+      const bccRecipients = buildRecipients(bcc);
+      const replyMessage = {};
+      if (toRecipients.length) replyMessage.toRecipients = toRecipients;
+      if (ccRecipients.length) replyMessage.ccRecipients = ccRecipients;
+      if (bccRecipients.length) replyMessage.bccRecipients = bccRecipients;
+      if (loaded.length) {
+        replyMessage.attachments = loaded.map((item) => item.attachment);
+      }
+
+      const fileSummary = summarizeLoadedFiles(loaded);
+      const replyKind = replyAll ? "reply-all" : "reply";
+
+      if (send_now) {
+        const original = await graphGetJson(
+          `${base}/messages/${encodedId}?$select=id,subject,conversationId,body`
+        );
+        const payload = {
+          comment: commentForOriginalBody(
+            body || "",
+            bodyType,
+            original.body?.contentType
+          ),
+        };
+        if (Object.keys(replyMessage).length) {
+          payload.message = replyMessage;
+        }
+
+        await graphSend(
+          "POST",
+          `${base}/messages/${encodedId}/${replyAll ? "replyAll" : "reply"}`,
+          payload
+        );
+
+        return {
+          structuredContent: {
+            action: "replied",
+            replyKind,
+            mailbox: mailbox || "me",
+            originalMessageId: original.id || messageId,
+            conversationId: original.conversationId || null,
+            subject: original.subject || "",
+            attachmentCount: loaded.length,
+            totalAttachmentBytes: totalBytes,
+          },
+          content: [
+            {
+              type: "text",
+              text: [
+                `Reply sent via Microsoft Graph (${replyKind}). It is in the original Outlook conversation, not a new thread.`,
+                `Subject: ${original.subject || "(no subject)"}`,
+                original.conversationId
+                  ? `Conversation ID: ${original.conversationId}`
+                  : "",
+                `Attachments:\n${fileSummary}`,
+              ]
+                .filter(Boolean)
+                .join("\n\n"),
+            },
+          ],
+        };
+      }
+
+      const draft = await graphSend(
+        "POST",
+        `${base}/messages/${encodedId}/${replyAll ? "createReplyAll" : "createReply"}`,
+        {}
+      );
+      if (!draft?.id) {
+        throw new Error(
+          "Microsoft Graph did not return a reply draft. The original message may no longer be available."
+        );
+      }
+
+      const patch = {};
+      if (toRecipients.length) patch.toRecipients = toRecipients;
+      if (ccRecipients.length) patch.ccRecipients = ccRecipients;
+      if (bccRecipients.length) patch.bccRecipients = bccRecipients;
+      if (body) {
+        patch.body = prependToDraftBody(draft.body, body, bodyType);
+      }
+
+      let updated = draft;
+      if (Object.keys(patch).length) {
+        updated =
+          (await graphSend(
+            "PATCH",
+            `${base}/messages/${encodeURIComponent(draft.id)}`,
+            patch
+          )) || draft;
+      }
+
+      for (const item of loaded) {
+        await graphSend(
+          "POST",
+          `${base}/messages/${encodeURIComponent(draft.id)}/attachments`,
+          item.attachment
+        );
+      }
+
+      const toStr =
+        formatRecipientAddresses(updated.toRecipients) ||
+        formatRecipientAddresses(draft.toRecipients);
+      const ccStr =
+        formatRecipientAddresses(updated.ccRecipients) ||
+        formatRecipientAddresses(draft.ccRecipients);
+      const recipientSummary = [
+        toStr ? `To: ${toStr}` : "",
+        ccStr ? `Cc: ${ccStr}` : "",
+        bccRecipients.length ? `Bcc: ${normalizeEmailList(bcc).join(", ")}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      return {
+        structuredContent: {
+          action: "reply_draft_created",
+          replyKind,
+          mailbox: mailbox || "me",
+          originalMessageId: messageId,
+          draftId: draft.id,
+          webLink: updated.webLink || draft.webLink || null,
+          conversationId: draft.conversationId || null,
+          subject: updated.subject || draft.subject || "",
+          attachmentCount: loaded.length,
+          totalAttachmentBytes: totalBytes,
+        },
+        content: [
+          {
+            type: "text",
+            text: [
+              `Reply draft created in Outlook (${replyKind}). It is in the original conversation — nothing was sent.`,
+              recipientSummary,
+              `Subject: ${updated.subject || draft.subject || "(no subject)"}`,
+              draft.conversationId
+                ? `Conversation ID: ${draft.conversationId}`
+                : "",
+              `Attachments:\n${fileSummary}`,
+              updated.webLink || draft.webLink
+                ? `Open to review and send:\n${updated.webLink || draft.webLink}`
+                : "",
+              "To send this threaded reply directly, call this tool again with send_now=true.",
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: String(err?.message || err) }],
+      };
+    }
+  };
+
+  registerAliases(
+    server,
+    "reply_outlook_email",
+    {
+      title: "Reply to Outlook Email (Same Thread)",
+      description:
+        "Reply in the same Outlook conversation as an existing message. Typical chain: list_recent_messages or search_messages → read_email(messageId) → reply_outlook_email(messageId, body). Pass the messageId of the mail you just listed or read; Graph createReply/reply keeps conversationId and In-Reply-To. Defaults to a draft; set send_now=true to send. Use replyAll=true when the original had multiple recipients. Do not use send_outlook_email for replies — that starts a new conversation.",
+      inputSchema: z.object({
+        messageId: z.string().describe(MESSAGE_ID_DESCRIPTION),
+        body: z
+          .string()
+          .optional()
+          .default("")
+          .describe("Reply text. Graph prepends this to the quoted original message."),
+        bodyType: z.enum(["Text", "HTML"]).optional().default("Text"),
+        replyAll: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe("true replies to the sender and all original recipients."),
+        to: z
+          .union([z.string(), z.array(z.string())])
+          .optional()
+          .describe(
+            "Optional To override. Omit to use Graph's default (original sender, or all recipients when replyAll is true)."
+          ),
+        cc: z.union([z.string(), z.array(z.string())]).optional(),
+        bcc: z.union([z.string(), z.array(z.string())]).optional(),
+        attachments: z
+          .array(z.string())
+          .optional()
+          .default([])
+          .describe("Absolute or relative local file paths to attach."),
+        send_now: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe("false (default) saves a threaded draft; true sends immediately."),
+        mailbox: z.string().default("me"),
+      }),
+    },
+    replyEmailHandler
   );
 
   return server;
