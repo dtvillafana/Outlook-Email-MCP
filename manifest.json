@@ -6,8 +6,8 @@
   "description": "Read Outlook email attachments and send local files (e.g. PPTX) as Outlook attachments locally inside Claude Desktop using Microsoft Graph.",
   "long_description": "A local single-user MCP server for Claude Desktop that authenticates to Microsoft 365 using device code flow, lists Outlook messages and attachments, and parses attachment content including OCR-scanned PDFs, Word, PowerPoint, Excel, images, archives, and Outlook MSG files. It can also compose an Outlook email with local files attached (such as a daily dashboard .pptx) and either save it as a draft for review or send it immediately.",
   "author": {
-    "name": "Zacccck",
-    "url": "https://github.com/Zacccck"
+    "name": "David Villafana",
+    "url": "https://github.com/dtvillafana"
   },
   "server": {
     "type": "node",

@@ -42,16 +42,15 @@
     "msg",
     "microsoft-graph"
   ],
-  "author": "Zacccck",
+  "author": "David Villafana",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Zacccck/Claude-MCP-Read-Email-Attachments.git",
-    "directory": "MCP_local"
+    "url": "https://github.com/dtvillafana/Outlook-Email-MCP.git"
   },
-  "homepage": "https://github.com/Zacccck/Claude-MCP-Read-Email-Attachments",
+  "homepage": "https://github.com/dtvillafana/Outlook-Email-MCP",
   "bugs": {
-    "url": "https://github.com/Zacccck/Claude-MCP-Read-Email-Attachments/issues"
+    "url": "https://github.com/dtvillafana/Outlook-Email-MCP/issues"
   },
   "engines": {
     "node": ">=20"

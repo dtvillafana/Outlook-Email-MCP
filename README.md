@@ -1,5 +1,4 @@
-# M365 Attachment Reader MCP Local
-[![Claude-MCP-Read-Email-Attachments MCP server](https://glama.ai/mcp/servers/Zacccck/Claude-MCP-Read-Email-Attachments/badges/score.svg)](https://glama.ai/mcp/servers/Zacccck/Claude-MCP-Read-Email-Attachments)
+# Outlook Email MCP
 
 A local `stdio` MCP server for Claude Desktop that reads Outlook emails and their attachments — and sends local files (e.g. a daily dashboard `.pptx`) as Outlook attachments — through the Microsoft Graph API.  
 
@@ -28,13 +27,6 @@ That means when you say "What does the PDF in my latest email say?", Claude can 
 This project fills that gap — running entirely on your local machine over `stdio`, with no public endpoints or tunnels required.
 
 ---
-
-## Recognition / Distribution
-
-- Listed in [`punkpeye/awesome-mcp-servers`](https://github.com/punkpeye/awesome-mcp-servers), a major community-curated registry of MCP servers.
-- Indexed by [Glama](https://glama.ai/mcp/servers/Zacccck/Claude-MCP-Read-Email-Attachments) with an MCP server score badge.
-  
-[![Claude-MCP-Read-Email-Attachments MCP server](https://glama.ai/mcp/servers/Zacccck/Claude-MCP-Read-Email-Attachments/badges/card.svg)](https://glama.ai/mcp/servers/Zacccck/Claude-MCP-Read-Email-Attachments)
 
 ## What It Does
 
@@ -150,8 +142,8 @@ Then:
 ### 2. Clone and Install
 
 ```bash
-git clone https://github.com/Zacccck/Claude-MCP-Read-Email-Attachments.git
-cd Claude-MCP-Read-Email-Attachments
+git clone https://github.com/dtvillafana/Outlook-Email-MCP.git
+cd Outlook-Email-MCP
 npm install
 ```
 
@@ -218,7 +210,7 @@ Add the following entry to `claude_desktop_config.json`:
     "m365-attachment-reader-local": {
       "command": "C:\\Program Files\\nodejs\\node.exe",
       "args": [
-        "C:\\path\\to\\Claude-MCP-Read-Email-Attachments\\server.mjs"
+        "C:\\path\\to\\Outlook-Email-MCP\\server.mjs"
       ],
       "env": {
         "M365_CLIENT_ID": "your-client-id",
@@ -378,7 +370,7 @@ The `send_outlook_email` tool composes a **new** outgoing Outlook message with o
 For debugging outside Claude Desktop, start the server manually:
 
 ```powershell
-cd Claude-MCP-Read-Email-Attachments
+cd Outlook-Email-MCP
 node .\server.mjs
 ```
 
@@ -406,7 +398,7 @@ docker run --rm -i `
 ## Project Structure
 
 ```text
-Claude-MCP-Read-Email-Attachments/
+Outlook-Email-MCP/
 ├── server.mjs
 ├── package.json
 ├── manifest.json

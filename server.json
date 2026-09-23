@@ -1,10 +1,10 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
-  "name": "io.github.zacccck/m365-attachment-reader-mcp-local",
+  "name": "io.github.dtvillafana/outlook-email-mcp",
   "description": "Local stdio MCP server for Claude Desktop that reads Outlook emails and message bodies, parses attachments (PDF/OCR/Word/PowerPoint/Excel/images/archives/MSG), and sends local files as Outlook attachments — via Microsoft Graph.",
   "status": "active",
   "repository": {
-    "url": "https://github.com/Zacccck/Claude-MCP-Read-Email-Attachments",
+    "url": "https://github.com/dtvillafana/Outlook-Email-MCP",
     "source": "github"
   },
   "version": "0.2.0",
