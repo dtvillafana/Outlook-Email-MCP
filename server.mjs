@@ -548,6 +548,25 @@ async function graphSend(method, url, bodyObj) {
   return text ? JSON.parse(text) : null;
 }
 
+async function graphDelete(url) {
+  const token = await getValidAccessToken();
+
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    log("graphDelete failed", { url, status: res.status, text });
+    throw new Error(`Graph API ${res.status}: ${text}`);
+  }
+
+  return null;
+}
+
 function mailboxPrefix(mailbox = "me") {
   return mailbox === "me"
     ? `${GRAPH_BASE}/me`
@@ -597,6 +616,19 @@ const MESSAGE_CHAIN_NEXT_TOOLS = {
   replyInThread: "reply_outlook_email",
   passField: "messageId",
 };
+
+const DRAFT_ID_DESCRIPTION =
+  "Outlook draftId from send_outlook_email, reply_outlook_email, or list_outlook_drafts. Only unsent drafts can be edited or deleted.";
+
+const DRAFT_NEXT_TOOLS = {
+  read: "read_email",
+  edit: "edit_outlook_draft",
+  delete: "delete_outlook_draft",
+  passField: "draftId",
+};
+
+const DRAFT_CHAIN_FOOTER =
+  "Next steps: pass draftId to read_email to review, edit_outlook_draft to change it, or delete_outlook_draft to discard it. Nothing is sent until you send it from Outlook or call send/reply with send_now=true.";
 
 function recipientAddresses(recipients) {
   return (recipients || [])
@@ -2789,6 +2821,7 @@ function createServer() {
           recipientCount,
           attachmentCount: loaded.length,
           totalAttachmentBytes: totalBytes,
+          nextTools: DRAFT_NEXT_TOOLS,
         },
         content: [
           {
@@ -2798,8 +2831,9 @@ function createServer() {
               recipientSummary,
               `Subject: ${message.subject || "(no subject)"}`,
               `Attachments:\n${fileSummary}`,
+              `draftId: ${draft?.id || ""}`,
               draft?.webLink ? `Open to review and send:\n${draft.webLink}` : "",
-              "To send directly, call this tool again with send_now=true.",
+              "To change this draft, call edit_outlook_draft with this draftId. To discard it, call delete_outlook_draft. To send without editing, call this tool again with send_now=true.",
             ]
               .filter(Boolean)
               .join("\n\n"),
@@ -3014,6 +3048,7 @@ function createServer() {
           subject: updated.subject || draft.subject || "",
           attachmentCount: loaded.length,
           totalAttachmentBytes: totalBytes,
+          nextTools: DRAFT_NEXT_TOOLS,
         },
         content: [
           {
@@ -3022,6 +3057,7 @@ function createServer() {
               `Reply draft created in Outlook (${replyKind}). It is in the original conversation — nothing was sent.`,
               recipientSummary,
               `Subject: ${updated.subject || draft.subject || "(no subject)"}`,
+              `draftId: ${draft.id}`,
               draft.conversationId
                 ? `Conversation ID: ${draft.conversationId}`
                 : "",
@@ -3029,7 +3065,7 @@ function createServer() {
               updated.webLink || draft.webLink
                 ? `Open to review and send:\n${updated.webLink || draft.webLink}`
                 : "",
-              "To send this threaded reply directly, call this tool again with send_now=true.",
+              "To change this draft, call edit_outlook_draft with this draftId. To discard it, call delete_outlook_draft. To send this threaded reply without editing, call this tool again with send_now=true.",
             ]
               .filter(Boolean)
               .join("\n\n"),
@@ -3086,6 +3122,343 @@ function createServer() {
       }),
     },
     replyEmailHandler
+  );
+
+  async function fetchDraft(mailbox, draftId) {
+    const base = mailboxPrefix(mailbox);
+    const draft = await graphGetJson(
+      `${base}/messages/${encodeURIComponent(draftId)}` +
+        `?$select=id,subject,isDraft,body,toRecipients,ccRecipients,bccRecipients,webLink,conversationId,hasAttachments,lastModifiedDateTime,from`
+    );
+    if (!draft?.isDraft) {
+      throw new Error(
+        "That message is not an unsent draft. edit_outlook_draft and delete_outlook_draft only work on drafts (draftId from send_outlook_email, reply_outlook_email, or list_outlook_drafts)."
+      );
+    }
+    return draft;
+  }
+
+  const listDraftsHandler = async ({ mailbox, top }) => {
+    try {
+      const collectionUrl = messageCollectionUrl(mailbox, "drafts");
+      const perPage = Math.min(Math.max(top, 1), 100);
+      let nextUrl =
+        `${collectionUrl}` +
+        `?$select=id,subject,lastModifiedDateTime,hasAttachments,toRecipients,ccRecipients,bodyPreview,conversationId,isDraft` +
+        `&$orderby=lastModifiedDateTime desc` +
+        `&$top=${perPage}`;
+
+      let drafts = [];
+      let pages = 0;
+      const maxPages = Math.min(Math.max(Math.ceil(top / 20), 5), 20);
+
+      while (nextUrl && drafts.length < top && pages < maxPages) {
+        const data = await graphGetJson(nextUrl);
+        const batch = data.value || [];
+        pages += 1;
+        drafts = drafts.concat(
+          batch.map((message) => ({
+            ...mapListedMessage(message),
+            draftId: message.id,
+            lastModifiedDateTime: message.lastModifiedDateTime || "",
+          }))
+        );
+        nextUrl = data["@odata.nextLink"] || null;
+      }
+
+      drafts = drafts.slice(0, top);
+      const text = drafts.length
+        ? `${drafts
+            .map((draft, index) => {
+              const lines = [
+                `${index + 1}. ${draft.subject || "(no subject)"}`,
+                draft.to?.length ? `To: ${draft.to.join(", ")}` : "",
+                draft.lastModifiedDateTime
+                  ? `Modified: ${draft.lastModifiedDateTime}`
+                  : "",
+                `Has Attachments: ${draft.hasAttachments}`,
+                `draftId: ${draft.draftId}`,
+              ];
+              return lines.filter(Boolean).join("\n");
+            })
+            .join("\n\n")}\n\n${DRAFT_CHAIN_FOOTER}`
+        : "No drafts found in the Drafts folder.";
+
+      return {
+        structuredContent: {
+          mailbox: mailbox || "me",
+          returnedCount: drafts.length,
+          drafts,
+          nextTools: DRAFT_NEXT_TOOLS,
+        },
+        content: [{ type: "text", text }],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: String(err?.message || err) }],
+      };
+    }
+  };
+
+  registerAliases(
+    server,
+    "list_outlook_drafts",
+    {
+      title: "List Outlook Drafts",
+      description:
+        "List unsent Outlook drafts, newest-modified first. Each result includes a draftId. Typical chain: list_outlook_drafts → read_email(draftId) → edit_outlook_draft(draftId) or delete_outlook_draft(draftId). send_outlook_email and reply_outlook_email also return a draftId when they save a draft.",
+      inputSchema: z.object({
+        mailbox: z.string().default("me"),
+        top: z.number().int().min(1).max(200).default(25),
+      }),
+    },
+    listDraftsHandler
+  );
+
+  const editDraftHandler = async ({
+    draftId,
+    to,
+    cc,
+    bcc,
+    subject,
+    body,
+    bodyType,
+    attachments,
+    mailbox,
+  }) => {
+    try {
+      ensureConfigured();
+
+      if (!draftId || !String(draftId).trim()) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: "draftId is required. Use list_outlook_drafts, or the draftId returned by send_outlook_email / reply_outlook_email.",
+            },
+          ],
+        };
+      }
+
+      const draft = await fetchDraft(mailbox, draftId);
+      const patch = {};
+      const toRecipients = to === undefined ? [] : buildRecipients(to);
+      const ccRecipients = cc === undefined ? [] : buildRecipients(cc);
+      const bccRecipients = bcc === undefined ? [] : buildRecipients(bcc);
+
+      if (to !== undefined) {
+        if (toRecipients.length === 0) {
+          return {
+            isError: true,
+            content: [
+              { type: "text", text: "If you set 'to', include at least one recipient." },
+            ],
+          };
+        }
+        patch.toRecipients = toRecipients;
+      }
+      if (cc !== undefined) patch.ccRecipients = ccRecipients;
+      if (bcc !== undefined) patch.bccRecipients = bccRecipients;
+      if (subject !== undefined) patch.subject = subject;
+      if (body !== undefined) {
+        const existingType = String(draft.body?.contentType || "Text");
+        const requestedType = bodyType || existingType;
+        const contentType =
+          String(requestedType).toLowerCase() === "html" ? "HTML" : "Text";
+        patch.body = {
+          contentType,
+          content: body,
+        };
+      }
+
+      let loaded = [];
+      let totalBytes = 0;
+      if (attachments && attachments.length) {
+        try {
+          ({ loaded, totalBytes } = prepareOutboundAttachments(attachments));
+        } catch (fileErr) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: String(fileErr?.message || fileErr) }],
+          };
+        }
+      }
+
+      if (!Object.keys(patch).length && !loaded.length) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: "Nothing to change. Pass at least one of: subject, body, to, cc, bcc, attachments.",
+            },
+          ],
+        };
+      }
+
+      const base = mailboxPrefix(mailbox);
+      const encodedId = encodeURIComponent(draft.id);
+      let updated = draft;
+      if (Object.keys(patch).length) {
+        updated = (await graphSend("PATCH", `${base}/messages/${encodedId}`, patch)) || draft;
+      }
+
+      for (const item of loaded) {
+        await graphSend(
+          "POST",
+          `${base}/messages/${encodedId}/attachments`,
+          item.attachment
+        );
+      }
+
+      const toStr =
+        formatRecipientAddresses(updated.toRecipients) ||
+        formatRecipientAddresses(draft.toRecipients);
+      const ccStr =
+        formatRecipientAddresses(updated.ccRecipients) ||
+        formatRecipientAddresses(draft.ccRecipients);
+      const fileSummary = summarizeLoadedFiles(loaded);
+
+      return {
+        structuredContent: {
+          action: "draft_updated",
+          mailbox: mailbox || "me",
+          draftId: draft.id,
+          webLink: updated.webLink || draft.webLink || null,
+          subject: updated.subject || draft.subject || "",
+          addedAttachmentCount: loaded.length,
+          totalAddedAttachmentBytes: totalBytes,
+          nextTools: DRAFT_NEXT_TOOLS,
+        },
+        content: [
+          {
+            type: "text",
+            text: [
+              "Draft updated (nothing was sent).",
+              toStr ? `To: ${toStr}` : "",
+              ccStr ? `Cc: ${ccStr}` : "",
+              `Subject: ${updated.subject || draft.subject || "(no subject)"}`,
+              `draftId: ${draft.id}`,
+              loaded.length ? `Added attachments:\n${fileSummary}` : "",
+              updated.webLink || draft.webLink
+                ? `Open to review and send:\n${updated.webLink || draft.webLink}`
+                : "",
+              DRAFT_CHAIN_FOOTER,
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: String(err?.message || err) }],
+      };
+    }
+  };
+
+  registerAliases(
+    server,
+    "edit_outlook_draft",
+    {
+      title: "Edit Outlook Draft",
+      description:
+        "Update an unsent Outlook draft. Pass draftId from send_outlook_email, reply_outlook_email, or list_outlook_drafts. Only fields you set are changed; omitted fields stay as they are. Providing body replaces the entire draft body (including any quoted original on a reply draft). New attachments are added; existing ones are left in place. Does not send. To discard instead, use delete_outlook_draft.",
+      inputSchema: z.object({
+        draftId: z.string().describe(DRAFT_ID_DESCRIPTION),
+        to: z
+          .union([z.string(), z.array(z.string())])
+          .optional()
+          .describe("Replace To recipients. Omit to leave unchanged."),
+        cc: z
+          .union([z.string(), z.array(z.string())])
+          .optional()
+          .describe("Replace Cc recipients. Omit to leave unchanged."),
+        bcc: z
+          .union([z.string(), z.array(z.string())])
+          .optional()
+          .describe("Replace Bcc recipients. Omit to leave unchanged."),
+        subject: z.string().optional().describe("Replace subject. Omit to leave unchanged."),
+        body: z
+          .string()
+          .optional()
+          .describe("Replace the entire draft body. Omit to leave unchanged."),
+        bodyType: z
+          .enum(["Text", "HTML"])
+          .optional()
+          .describe("Used only when body is set. Defaults to the draft's current body type."),
+        attachments: z
+          .array(z.string())
+          .optional()
+          .describe("Local file paths to add as attachments. Existing attachments are kept."),
+        mailbox: z.string().default("me"),
+      }),
+    },
+    editDraftHandler
+  );
+
+  const deleteDraftHandler = async ({ draftId, mailbox }) => {
+    try {
+      ensureConfigured();
+
+      if (!draftId || !String(draftId).trim()) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: "draftId is required. Use list_outlook_drafts, or the draftId returned by send_outlook_email / reply_outlook_email.",
+            },
+          ],
+        };
+      }
+
+      const draft = await fetchDraft(mailbox, draftId);
+      const base = mailboxPrefix(mailbox);
+      await graphDelete(`${base}/messages/${encodeURIComponent(draft.id)}`);
+
+      return {
+        structuredContent: {
+          action: "draft_deleted",
+          mailbox: mailbox || "me",
+          draftId: draft.id,
+          subject: draft.subject || "",
+        },
+        content: [
+          {
+            type: "text",
+            text: [
+              "Draft deleted. It was not sent.",
+              `Subject: ${draft.subject || "(no subject)"}`,
+              `draftId: ${draft.id}`,
+            ].join("\n"),
+          },
+        ],
+      };
+    } catch (err) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: String(err?.message || err) }],
+      };
+    }
+  };
+
+  registerAliases(
+    server,
+    "delete_outlook_draft",
+    {
+      title: "Delete Outlook Draft",
+      description:
+        "Permanently delete an unsent Outlook draft. Pass draftId from send_outlook_email, reply_outlook_email, or list_outlook_drafts. Refuses to delete messages that are not drafts. This cannot be undone.",
+      inputSchema: z.object({
+        draftId: z.string().describe(DRAFT_ID_DESCRIPTION),
+        mailbox: z.string().default("me"),
+      }),
+    },
+    deleteDraftHandler
   );
 
   return server;

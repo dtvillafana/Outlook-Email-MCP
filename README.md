@@ -10,6 +10,7 @@ A local `stdio` MCP server for Claude Desktop that reads Outlook emails and thei
 
 - **`send_outlook_email`** — compose an Outlook email with **local files attached** (e.g. a `.pptx`) and either save it as a **draft** for review (default) or send it immediately (`send_now: true`). Small attachments only (each < 3 MB, inlined via Microsoft Graph). This starts a **new** conversation.
 - **`reply_outlook_email`** — reply to an existing message so the response stays in the **same Outlook conversation** (Graph `createReply` / `reply`, not `sendMail`). Draft by default; `send_now: true` sends immediately; `replyAll: true` includes all original recipients.
+- **`list_outlook_drafts` / `edit_outlook_draft` / `delete_outlook_draft`** — list unsent drafts, update subject/body/recipients (and add attachments), or permanently discard a draft. Edit and delete refuse sent mail.
 - **`read_email`** — read the full **text/body** of a specific Outlook email (subject, sender, recipients, date; HTML converted to plain text). The original tools read *attachments*; this reads the *message body* itself.
 - **`list_recent_messages`** now also returns a `bodyPreview` snippet per message.
 - **Persistent login** — the MSAL token cache (incl. the refresh token) is now persisted to disk, so auth **survives app/process restarts**: sign in once and the server silently refreshes tokens (no more re-auth every restart). This makes unattended/scheduled use possible.
@@ -71,8 +72,11 @@ This server runs as a local MCP process started by Claude Desktop. It:
 | `read_email_attachment` | Download, parse, and return attachment content |
 | `read_email` | Read one email by `messageId` (subject, sender, recipients, date, body) |
 | `read_email_body_chunk` | Read the message body in offset-based slices when `read_email` truncated it |
-| `send_outlook_email` | Compose a **new** email, attach local files (e.g. `.pptx`), and save a draft (default) or send immediately. Starts a new conversation. |
-| `reply_outlook_email` | Reply to an existing message **in the same Outlook thread** using that `messageId`. Draft by default; `send_now: true` sends; `replyAll: true` includes all original recipients. |
+| `send_outlook_email` | Compose a **new** email, attach local files (e.g. `.pptx`), and save a draft (default) or send immediately. Starts a new conversation. Returns `draftId` when saved as a draft. |
+| `reply_outlook_email` | Reply to an existing message **in the same Outlook thread** using that `messageId`. Draft by default; `send_now: true` sends; `replyAll: true` includes all original recipients. Returns `draftId` when saved as a draft. |
+| `list_outlook_drafts` | List unsent drafts. Each result includes a `draftId` for edit/delete. |
+| `edit_outlook_draft` | Update an unsent draft (`subject`, `body`, recipients, add attachments). Does not send. |
+| `delete_outlook_draft` | Permanently delete an unsent draft. Refuses to delete sent mail. |
 
 **Typical chain (list → read → reply in-thread):**
 
@@ -80,7 +84,7 @@ This server runs as a local MCP process started by Claude Desktop. It:
 2. `read_email` with that `messageId` (then `read_email_body_chunk` if the body was truncated)
 3. `reply_outlook_email` with the **same** `messageId` — this stays in the Outlook conversation
 
-> **Outbound send is opt-in per call.** `send_outlook_email` and `reply_outlook_email` default to creating a **draft** in your Drafts folder — nothing leaves your mailbox until you review and send it in Outlook. Pass `send_now: true` to send directly. Each attachment must be **under 3 MB** (see Limitations). Use `reply_outlook_email` for replies; `send_outlook_email` with an `RE:` subject still starts a **new** thread.
+> **Outbound send is opt-in per call.** `send_outlook_email` and `reply_outlook_email` default to creating a **draft** in your Drafts folder — nothing leaves your mailbox until you review and send it in Outlook. Pass `send_now: true` to send directly. Change a draft with `edit_outlook_draft` or discard it with `delete_outlook_draft` (both take the returned `draftId`). Each attachment must be **under 3 MB** (see Limitations). Use `reply_outlook_email` for replies; `send_outlook_email` with an `RE:` subject still starts a **new** thread.
 
 ---
 
@@ -344,6 +348,29 @@ The `send_outlook_email` tool composes a **new** outgoing Outlook message with o
 - **Draft (default):** `POST /me/messages/{id}/createReply` (or `createReplyAll`), then patches in your reply text and returns the draft's `webLink`.
 - **Send now (`send_now: true`):** `POST /me/messages/{id}/reply` (or `replyAll`) in a single call. The reply is saved to Sent Items.
 - Recipients default to the original sender (`reply`) or everyone on the original (`replyAll`).
+
+---
+
+## Editing and Deleting Drafts
+
+`send_outlook_email` and `reply_outlook_email` return a `draftId` when they save a draft. Use that id with `edit_outlook_draft` / `delete_outlook_draft`, or call `list_outlook_drafts` to find older drafts. Both refuse to touch messages that are not unsent drafts.
+
+| Tool | Parameter | Type | Default | Description |
+|---|---|---|---|---|
+| `list_outlook_drafts` | `top` | number | `25` | How many drafts to return (newest-modified first). |
+| `edit_outlook_draft` | `draftId` | string | — (required) | Draft to update. |
+| | `to`, `cc`, `bcc` | string \| string[] | — | Replace that recipient list. Omit to leave unchanged. |
+| | `subject` | string | — | Replace subject. Omit to leave unchanged. |
+| | `body` | string | — | Replace the **entire** draft body (including quoted original on a reply draft). |
+| | `bodyType` | `"Text"` \| `"HTML"` | draft's current type | Used only when `body` is set. |
+| | `attachments` | string[] | — | Local files to **add**. Existing attachments are kept. |
+| `delete_outlook_draft` | `draftId` | string | — (required) | Draft to permanently delete. Cannot be undone. |
+
+**Behavior**
+
+- **Edit:** `PATCH /me/messages/{id}` for subject/body/recipients, then `POST .../attachments` for new files. Nothing is sent.
+- **Delete:** `DELETE /me/messages/{id}` after confirming `isDraft` is true.
+- Typical chain: `list_outlook_drafts` → `read_email(draftId)` → `edit_outlook_draft` or `delete_outlook_draft`.
 
 ---
 

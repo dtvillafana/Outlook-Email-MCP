@@ -108,6 +108,18 @@
     {
       "name": "reply_outlook_email",
       "description": "Reply in the same Outlook thread. Pass the messageId from list/search/read. Saves a draft by default, or sends immediately."
+    },
+    {
+      "name": "list_outlook_drafts",
+      "description": "List unsent Outlook drafts. Each result includes a draftId for edit_outlook_draft or delete_outlook_draft."
+    },
+    {
+      "name": "edit_outlook_draft",
+      "description": "Update an unsent Outlook draft (subject, body, recipients, add attachments). Does not send."
+    },
+    {
+      "name": "delete_outlook_draft",
+      "description": "Permanently delete an unsent Outlook draft. Refuses to delete sent mail."
     }
   ],
   "compatibility": {
